@@ -9,7 +9,6 @@ import accountService from './account-service';
 import BizError from '../error/biz-error';
 import emailUtils from '../utils/email-utils';
 import fileUtils from '../utils/file-utils';
-import { Resend } from 'resend';
 import attService from './att-service';
 import { parseHTML } from 'linkedom';
 import userService from './user-service';
@@ -411,11 +410,12 @@ const emailService = {
 		}
 
 		const domain = emailUtils.getDomain(accountRow.email);
-		const resendToken = resendTokens[domain];
+		// resendTokens 为历史字段名，当前存放各域名对应的 Maileroo API Key。
+		const mailerooToken = resendTokens[domain];
 		const useCloudflareEmail = !!c.env.email;
 
 		//如果接收方存在站外邮箱，又没有发信服务
-		if (!useCloudflareEmail && !resendToken && !allInternal) {
+		if (!useCloudflareEmail && !mailerooToken && !allInternal) {
 			throw new BizError(t('noSendProvider'));
 		}
 
@@ -461,7 +461,7 @@ const emailService = {
 		const separate = params.manyType === 'divide';
 		// sendParams 用于渠道请求，saveParams 保留保存记录所需的账号、权限和附件数据。
 		const context = {
-			separate, allInternal, useCloudflareEmail, resendToken, sendParams,
+			separate, allInternal, useCloudflareEmail, mailerooToken, sendParams,
 			saveParams: {
 				accountId, userId, name, subject, text, html,
 				sendEmail: accountRow.email,
@@ -471,14 +471,14 @@ const emailService = {
 			}
 		};
 
-		// 全部站内收件人走本地投递；存在站外收件人时优先 CF，其次 Resend。
+		// 全部站内收件人走本地投递；存在站外收件人时优先 CF，其次 Maileroo。
 		let deliveries;
 		if (allInternal) {
 			deliveries = this.sendInternal(c, context);
 		} else if (useCloudflareEmail) {
 			deliveries = this.sendCloudflare(c, context);
 		} else {
-			deliveries = this.sendResend(c, context);
+			deliveries = this.sendMaileroo(c, context);
 		}
 
 		const emailResults = [];
@@ -545,35 +545,27 @@ const emailService = {
 		}
 	},
 
-	// Resend 分开发送一次最多提交 100 封独立邮件，普通发送仍调用单封接口。
-	async *sendResend(c, { separate, resendToken, sendParams, saveParams }) {
-		if (separate && sendParams.receiveEmail.length > 100) {
-			throw new BizError(t('resendRecipientLimit'));
+	// Maileroo 分开发送使用批量接口（单次最多 500 封），普通发送调用单封接口。
+	async *sendMaileroo(c, { separate, mailerooToken, sendParams, saveParams }) {
+		if (sendParams.receiveEmail.length > 500) {
+			throw new BizError(t('mailerooRecipientLimit'));
 		}
-		// 批量接口不支持附件，包含正文转换得到的内嵌附件。
-		if (separate && sendParams.attachments.length > 0) {
-			throw new BizError(t('resendSeparateAttachments'));
-		}
-		let result;
+		let referenceIds;
 		try {
-			result = separate
-				? await this.sendBatchByResend(resendToken, sendParams)
-				: await this.sendByResend(resendToken, sendParams);
+			referenceIds = separate
+				? await this.sendBatchByMaileroo(mailerooToken, sendParams)
+				: [await this.sendByMaileroo(mailerooToken, sendParams)];
 		} catch (error) {
 			if (!separate) throw error;
 			yield { error: { message: error.message } };
 			return;
 		}
-		if (result.error) {
-			yield { error: result.error };
-			return;
-		}
-		// 严格校验模式下，批量返回的邮件 ID 按提交顺序对应各收件人。
+		// 批量接口返回的 reference_id 按提交顺序对应各收件人。
 		const items = separate
 			? sendParams.receiveEmail.map((address, index) => ({
-				receiveEmail: [address], id: result.data.data[index].id
+				receiveEmail: [address], id: referenceIds[index]
 			}))
-			: [{ receiveEmail: sendParams.receiveEmail, id: result.data?.id }];
+			: [{ receiveEmail: sendParams.receiveEmail, id: referenceIds[0] }];
 		const emails = [];
 		for (const item of items) {
 			emails.push(await this.saveSentEmail(c, {
@@ -636,24 +628,36 @@ const emailService = {
 		return emailResult;
 	},
 
-	// 附件已在 Resend 处理器中校验，批量接口为每位收件人构造独立邮件。
-	async sendBatchByResend(resendToken, params) {
-		const resend = new Resend(resendToken);
+	// 批量接口为每位收件人构造独立邮件，正文和附件由整批共用。
+	async sendBatchByMaileroo(mailerooToken, params) {
 		const sendForm = {
-			from: `${params.name} <${params.accountEmail}>`,
 			subject: params.subject,
-			text: params.text,
-			html: params.html
+			messages: params.receiveEmail.map(address => ({
+				from: { address: params.accountEmail, display_name: params.name },
+				to: [{ address }]
+			}))
 		};
+		const attachments = await this.toMailerooAttachments(params.attachments);
+		if (attachments.length > 0) {
+			sendForm.attachments = attachments;
+		}
+		if (params.html) {
+			sendForm.html = params.html;
+		}
+		if (params.text) {
+			sendForm.plain = params.text;
+		}
+		if (!params.html && !params.text) {
+			sendForm.plain = '';
+		}
 		if (params.sendType === 'reply' && params.messageId) {
 			sendForm.headers = {
 				'in-reply-to': params.messageId,
 				'references': params.messageId
 			};
 		}
-		return resend.batch.send(params.receiveEmail.map(address => ({
-			...sendForm, to: [address]
-		})), { batchValidation: 'strict' });
+		const result = await this.sendMailerooRequest(mailerooToken, '/api/v2/emails/bulk', sendForm);
+		return result.data?.reference_ids || [];
 	},
 
 	async sendByCloudflareEmail(c, params) {
@@ -692,26 +696,60 @@ const emailService = {
 		};
 	},
 
-	async sendByResend(resendToken, params) {
-		const resend = new Resend(resendToken);
-
+	async sendByMaileroo(mailerooToken, params) {
 		const sendForm = {
-			from: `${params.name} <${params.accountEmail}>`,
-			to: [...params.receiveEmail],
-			subject: params.subject,
-			text: params.text,
-			html: params.html,
-			attachments: await this.toResendAttachments(params.attachments)
+			from: { address: params.accountEmail, display_name: params.name },
+			to: params.receiveEmail.map(address => ({ address })),
+			subject: params.subject
 		};
+		const attachments = await this.toMailerooAttachments(params.attachments);
+		if (attachments.length > 0) {
+			sendForm.attachments = attachments;
+		}
 
-		if (params.sendType === 'reply') {
+		if (params.html) {
+			sendForm.html = params.html;
+		}
+		if (params.text) {
+			sendForm.plain = params.text;
+		}
+		if (!params.html && !params.text) {
+			sendForm.plain = '';
+		}
+
+		if (params.sendType === 'reply' && params.messageId) {
 			sendForm.headers = {
 				'in-reply-to': params.messageId,
 				'references': params.messageId
 			};
 		}
 
-		return await resend.emails.send(sendForm);
+		const result = await this.sendMailerooRequest(mailerooToken, '/api/v2/emails', sendForm);
+		return result.data?.reference_id;
+	},
+
+	async sendMailerooRequest(mailerooToken, path, body) {
+		const response = await fetch('https://smtp.maileroo.com' + path, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Api-Key': mailerooToken
+			},
+			body: JSON.stringify(body)
+		});
+
+		let result = null;
+		try {
+			result = await response.json();
+		} catch (e) {
+			// 非 JSON 响应按请求失败处理
+		}
+
+		if (!response.ok || !result?.success) {
+			throw new Error(result?.message || `Maileroo request failed (${response.status})`);
+		}
+
+		return result;
 	},
 
 	async toCloudflareAttachments(attachments) {
@@ -733,7 +771,7 @@ const emailService = {
 		});
 	},
 
-	async toResendAttachments(attachments = []) {
+	async toMailerooAttachments(attachments = []) {
 		const result = [];
 
 		for (const attachment of attachments) {
@@ -742,10 +780,13 @@ const emailService = {
 				continue;
 			}
 
+			const inline = !!attachment.contentId;
 			result.push({
-				...attachment,
+				// Maileroo 以 file_name 作为内联图片的 cid，正文中使用的是 cid:<contentId>
+				file_name: inline ? attachment.contentId : attachment.filename,
+				content_type: attachment.contentType || attachment.mimeType || attachment.type || 'application/octet-stream',
 				content,
-				contentType: attachment.contentType || attachment.mimeType || attachment.type || 'application/octet-stream'
+				inline
 			});
 		}
 
